@@ -26,7 +26,7 @@ from .agent import (
 from .agent.claude_adapter import ClaudeAdapter  # noqa: F401 (re-exported for tests)
 from .agent import make_adapter
 from .approvals import ApprovalManager
-from .cards import CardState, StreamingCard
+from .cards import CardState, StreamingCard, render_stuck_card, render_stuck_card_resolved
 from .config import BridgeConfig
 from .lark import Lark
 from . import session_store
@@ -43,6 +43,7 @@ class ScopeRunner:
         approvals: ApprovalManager,
         *,
         adapter_factory: Optional[Callable[[], Any]] = None,
+        restart_cb: Optional[Callable[[], None]] = None,
     ) -> None:
         self.scope = scope
         self.chat_id = chat_id
@@ -50,6 +51,8 @@ class ScopeRunner:
         self.lark = lark
         self.approvals = approvals
         self._adapter_factory = adapter_factory or self._default_adapter_factory
+        # Runtime hook to self-restart the whole bridge (stuck card "Restart bridge").
+        self._restart_cb = restart_cb
 
         self._busy = False
         self._stop_flag = False
@@ -57,6 +60,8 @@ class ScopeRunner:
         self._card: Optional[StreamingCard] = None
         self._state: Optional[CardState] = None
         self._watchdog: Optional[StuckWatchdog] = None
+        self._stuck_card_msg: Optional[str] = None
+        self._stuck_open = False
 
     def _default_adapter_factory(self) -> AgentAdapter:
         # stderr of the agent CLI goes to a log file (observability): a codex
@@ -139,6 +144,8 @@ class ScopeRunner:
             await self._adapter.start()
 
         self._stop_flag = False
+        self._stuck_card_msg = None
+        self._stuck_open = False
         wd = StuckWatchdog(self.cfg.stuck_timeout, self._on_stuck,
                            is_approval_pending=lambda: self.approvals.has_pending)
         wd.start()
@@ -155,6 +162,9 @@ class ScopeRunner:
             wd.stop()
             self._watchdog = None
             self._card_task.cancel()
+            if self._stuck_open:  # turn ended with the stuck card unanswered (e.g. via /stop)
+                self._stuck_open = False
+                self._resolve_stuck_card("ended")
         await self._finalize(result, message_id, onit)
 
     async def _card_loop(self) -> None:
@@ -201,6 +211,13 @@ class ScopeRunner:
     async def _emit(self, event) -> None:
         if self._watchdog is not None:
             self._watchdog.bump()
+        if self._stuck_open:
+            # Activity resumed on its own (e.g. a slow API finally answered) —
+            # dismiss the stuck card so it doesn't sit in chat looking actionable.
+            self._stuck_open = False
+            print(f"[turn {self.scope}] activity resumed — dismissing stuck card",
+                  file=sys.stderr, flush=True)
+            self._resolve_stuck_card("recovered")
         if self._state is None or self._card is None:
             return
         st = self._state
@@ -245,14 +262,69 @@ class ScopeRunner:
         )
 
     async def _on_stuck(self) -> None:
-        self._stop_flag = True
-        if self._state is not None:
-            self._state.status = "(no activity — stopping)"
-            self._state.phase = "stopped"
-            if self._card is not None:
-                await self._card.update(self._state)
-        if self._adapter is not None:
-            try:
-                await self._adapter.interrupt()
-            except Exception:
-                pass
+        """Watchdog fired: no stream events for ``stuck_timeout`` seconds. Log it and
+        ASK the user (card) instead of silently interrupting — the graceful control
+        interrupt cannot break a process wedged on e.g. a hung API stream."""
+        secs = self.cfg.stuck_timeout
+        print(f"[turn {self.scope}] watchdog: no stream events for {secs}s — posting stuck card",
+              file=sys.stderr, flush=True)
+        try:
+            if self._state is not None:
+                self._state.status = f"⚠️ no activity for {secs}s — see the stuck card in chat"
+                if self._card is not None:
+                    await self._card.update(self._state)
+            self._stuck_card_msg = self.lark.send_card(
+                self.chat_id,
+                render_stuck_card(scope=self.scope, seconds=secs,
+                                  prompt=self._state.prompt if self._state else ""),
+            )
+            self._stuck_open = True
+        except Exception as e:  # never wedge the watchdog task
+            print(f"[scope {self.scope}] stuck card failed: {e!r}", file=sys.stderr, flush=True)
+
+    async def resolve_stuck(self, verb: str) -> None:
+        """User tapped a button on the stuck card: wait / kill / restart."""
+        if not self._stuck_open:
+            return  # stale tap (turn already recovered or ended)
+        self._stuck_open = False
+        if verb == "stuck_wait":
+            print(f"[turn {self.scope}] stuck card: user chose to keep waiting; "
+                  f"watchdog re-armed", file=sys.stderr, flush=True)
+            self._resolve_stuck_card("wait")
+            if self._watchdog is not None:
+                self._watchdog.start()  # fires again (new card) if still silent
+        elif verb == "stuck_kill":
+            print(f"[turn {self.scope}] stuck card: user chose KILL — killing agent process",
+                  file=sys.stderr, flush=True)
+            self._resolve_stuck_card("kill")
+            self._stop_flag = True
+            if self._state is not None:
+                self._state.status = "Killed (stuck)"
+            if self._adapter is not None:
+                try:
+                    await self._adapter.kill()
+                except Exception as e:
+                    print(f"[scope {self.scope}] kill error: {e!r}", file=sys.stderr, flush=True)
+            # EOF unblocks run_turn, which finalizes as Stopped; the adapter is dropped
+            # so the NEXT message builds a fresh process instead of writing to a corpse.
+            self._adapter = None
+        elif verb == "stuck_restart":
+            print(f"[turn {self.scope}] stuck card: user chose RESTART BRIDGE",
+                  file=sys.stderr, flush=True)
+            self._resolve_stuck_card("restart")
+            if self._restart_cb is not None:
+                self._restart_cb()
+            else:
+                self.lark.send_text(
+                    self.chat_id, "(restart unavailable here — use: feishu-bridge stop && feishu-bridge up)")
+        else:
+            self._stuck_open = True  # unknown verb: leave the card actionable
+
+    def _resolve_stuck_card(self, chosen: str) -> None:
+        if self._stuck_card_msg is None:
+            return
+        msg_id, self._stuck_card_msg = self._stuck_card_msg, None
+        try:
+            self.lark.update_card(msg_id, render_stuck_card_resolved(chosen=chosen))
+        except Exception:
+            pass

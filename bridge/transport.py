@@ -236,6 +236,18 @@ class Transport:
         except (asyncio.TimeoutError, RuntimeError):
             pass
 
+    async def kill(self) -> None:
+        """Force-kill the whole process tree NOW (wedged turn; the graceful path failed).
+        The read loop then sees EOF, which unblocks ``events()`` so the turn finalizes."""
+        if self._proc is None:
+            return
+        self._closing = True
+        self._kill_tree()
+        try:
+            await asyncio.wait_for(self._proc.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            pass
+
     # ------------------------------------------------------------------ inbound
 
     async def events(self):
