@@ -24,7 +24,9 @@ class StuckWatchdog:
         self._timeout = timeout
         self._on_stuck = on_stuck
         self._is_approval_pending = is_approval_pending
-        self._tick = tick
+        # Poll no slower than half the timeout, so a small timeout doesn't wait a
+        # full default tick (5s) before its first check.
+        self._tick = max(min(tick, timeout / 2.0), 0.05)
         self._task: asyncio.Task | None = None
         self._last_event = time.monotonic()
         self._fired = False

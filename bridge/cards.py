@@ -151,6 +151,63 @@ def render_approval_card_resolved(*, tool: str, chosen: str, summary: str, conte
     }
 
 
+def render_stuck_card(*, scope: str, seconds: int, prompt: str) -> dict:
+    """Stuck-turn decision card. The watchdog posts it when a turn shows no stream
+    activity for ``FEISHU_STUCK_TIMEOUT`` seconds: the graceful control-protocol
+    interrupt may not break a wedged agent process, so the user decides."""
+    body = [
+        {"tag": "div", "text": _md(
+            f"No activity for **{seconds}s**. The agent process may be wedged "
+            "(e.g. a hung API stream). Choose an action:"
+        )},
+    ]
+    if prompt:
+        body.append({"tag": "note", "elements": [_plain("task: " + _truncate(prompt, 200))]})
+    body.append({"tag": "note", "elements": [_plain(
+        "Tip: if the buttons don't respond, /stop tries a graceful interrupt; "
+        "`feishu-bridge stop && feishu-bridge up` restarts from the CLI")]})
+    body.append({
+        "tag": "action",
+        "actions": [
+            {"tag": "button", "type": "default", "text": _plain("⏳ Keep waiting"),
+             "value": {"v": "stuck_wait", "s": scope}},
+            {"tag": "button", "type": "danger", "text": _plain("🔪 Kill turn"),
+             "value": {"v": "stuck_kill", "s": scope}},
+            {"tag": "button", "type": "primary", "text": _plain("🔄 Restart bridge"),
+             "value": {"v": "stuck_restart", "s": scope}},
+        ],
+    })
+    return {
+        "config": {"wide_screen_mode": True, "update_multi": True},
+        "header": {"title": _plain("⚠️ Turn appears stuck"), "template": "red"},
+        "elements": body,
+    }
+
+
+def render_stuck_card_resolved(*, chosen: str) -> dict:
+    """Render the stuck card AFTER the user chose (or the turn recovered/ended)."""
+    info = {
+        "wait": ("⏳ Keeping waiting", "blue", "Keep waiting"),
+        "kill": ("🔪 Turn killed", "grey", "Kill turn"),
+        "restart": ("🔄 Bridge restarting…", "orange", "Restart bridge"),
+        "recovered": ("✅ Turn recovered on its own", "green", "Recovered"),
+        "ended": ("⏹ Turn ended", "grey", "Turn ended"),
+        "ignored": ("⏹ Turn already ended", "grey", "Turn ended"),
+    }.get(chosen, ("Resolved", "grey", chosen))
+    title, template, label = info
+    return {
+        "config": {"wide_screen_mode": True, "update_multi": True},
+        "header": {"title": _plain(title), "template": template},
+        "elements": [
+            {"tag": "note", "elements": [_plain(f"you clicked: {label}")]},
+            {"tag": "action", "actions": [
+                {"tag": "button", "type": "default", "text": _plain(f"{label}  ✓"),
+                 "value": {"v": "noop"}, "disabled": True},
+            ]},
+        ],
+    }
+
+
 def _truncate(s: str, n: int) -> str:
     s = (s or "").strip()
     return s if len(s) <= n else s[: n - 1] + "…"

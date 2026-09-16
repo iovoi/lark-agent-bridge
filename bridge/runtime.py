@@ -8,6 +8,7 @@ entry used by the supervisor (``feishu-bridge run``).
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import time
 from typing import Awaitable, Callable, Optional
@@ -70,7 +71,8 @@ class Runtime:
         chat_id = evt.get("chat_id") or ""
         runner = self.scopes.get(scope)
         if runner is None:
-            runner = ScopeRunner(scope, chat_id, self.cfg, self.lark, self.approvals)
+            runner = ScopeRunner(scope, chat_id, self.cfg, self.lark, self.approvals,
+                                 restart_cb=self.request_restart)
             self.scopes[scope] = runner
 
         if text == "/stop":
@@ -107,8 +109,30 @@ class Runtime:
             runner = self.scopes.get(scope) if scope else None
             if runner is not None:
                 await runner.request_stop()
+        elif verb in ("stuck_wait", "stuck_kill", "stuck_restart"):
+            runner = self.scopes.get(scope) if scope else None
+            if runner is not None:
+                await runner.resolve_stuck(verb)
         elif verb in ("approve", "deny", "deny_stop", "approve_all") and token:
             self.approvals.resolve(token, verb)
+
+    # ---- self-restart (stuck card "Restart bridge") ---------------------------
+
+    def request_restart(self) -> None:
+        """Spawn a replacement bridge process and exit this one. Called from the
+        runtime loop; ``os._exit`` skips asyncio teardown (a wedged turn may be
+        holding it). The replacement takes over the pidfile."""
+        from . import supervisor
+
+        print("[runtime] restart requested — respawning bridge", file=sys.stderr, flush=True)
+        try:
+            pid = supervisor.respawn()
+            print(f"[runtime] replacement bridge started (pid {pid}); exiting",
+                  file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"[runtime] respawn failed: {e!r} — NOT exiting", file=sys.stderr, flush=True)
+            return
+        os._exit(0)
 
     @staticmethod
     def _scope_of(evt: dict) -> str:

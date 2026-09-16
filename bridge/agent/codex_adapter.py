@@ -397,6 +397,11 @@ class CodexAdapter:
             except ProcessLookupError:
                 pass
 
+    async def kill(self) -> None:
+        # In exec mode interrupt() is already a hard tree-kill.
+        await self.interrupt()
+        self._started = False
+
     async def stop(self) -> None:
         await self.interrupt()
         if self._stderr_task is not None:

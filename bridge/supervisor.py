@@ -72,13 +72,8 @@ def _running_pid() -> int | None:
 
 # ---- commands ----------------------------------------------------------------
 
-def up() -> int:
-    RUN_DIR.mkdir(parents=True, exist_ok=True)
-    pid = _running_pid()
-    if pid:
-        print(f"feishu-bridge already running (pid {pid})")
-        return 0
-
+def _spawn() -> int:
+    """Start a detached bridge process, point the pidfile at it, return its pid."""
     cmd = [sys.executable, "-m", "bridge", "run"]
     out = open(LOGFILE, "ab", buffering=0)
     popen_kwargs: dict = {
@@ -100,7 +95,25 @@ def up() -> int:
 
     proc = subprocess.Popen(cmd, **popen_kwargs)
     PIDFILE.write_text(str(proc.pid))
-    print(f"feishu-bridge started (pid {proc.pid}); logs: {LOGFILE}")
+    return proc.pid
+
+
+def respawn() -> int:
+    """Spawn a replacement bridge process (for in-place self-restart from a running
+    bridge). The caller then exits; the replacement takes over the pidfile."""
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    return _spawn()
+
+
+def up() -> int:
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    pid = _running_pid()
+    if pid:
+        print(f"feishu-bridge already running (pid {pid})")
+        return 0
+
+    pid = _spawn()
+    print(f"feishu-bridge started (pid {pid}); logs: {LOGFILE}")
     return 0
 
 

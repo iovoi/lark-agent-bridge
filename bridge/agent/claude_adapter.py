@@ -164,6 +164,12 @@ class ClaudeAdapter:
     async def interrupt(self) -> None:
         await self._transport.interrupt()
 
+    async def kill(self) -> None:
+        """Hard-kill the wedged subprocess; the scope drops the adapter so the next
+        message builds a fresh process (fresh thread, like a bridge restart)."""
+        await self._transport.kill()
+        self._started = False
+
     async def stop(self) -> None:
         await self._transport.close()
         self._started = False
